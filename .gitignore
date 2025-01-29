@@ -1,0 +1,12 @@
+# Ignore virtual environment
+env/
+
+# Ignore API keys & secrets
+backend/weather-notification.json
+backend/.env
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
