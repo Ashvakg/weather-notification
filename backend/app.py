@@ -1,15 +1,18 @@
 from flask import Flask, jsonify, request
 import firebase_admin
-from firebase_admin import credentials, db
+from firebase_admin import credentials, db, messaging
 import requests
 import os
+import time
 from dotenv import load_dotenv
+import threading
 
 app = Flask(__name__)
 
 # --- Load environment variables ---
 load_dotenv()
-api_key = os.getenv('OPENWEATHER_API_KEY')
+API_KEY = os.getenv('OPENWEATHER_API_KEY')
+FCM_SERVER_KEY = os.getenv('FCM_SERVER_KEY')
 
 # --- Initialize Firebase (Only if not already initialized) ---
 if not firebase_admin._apps:
@@ -31,38 +34,51 @@ def save_preferences():
         if not all(field in data for field in required_fields):
             return jsonify({"error": "Missing required fields"}), 400
 
-        # Save preferences under user's Firebase ID
         user_id = data["user_id"]
-        db.reference(f'users/{user_id}/preferences').push(data)  # Allow multiple alerts
+        db.reference(f'users/{user_id}/preferences').push(data)
         
         return jsonify({"message": "Preferences saved successfully!"}), 200
     
     except Exception as e:
         return jsonify({"error": f"Failed to save preferences: {str(e)}"}), 500
 
+# --- SAVE FCM TOKEN ROUTE ---
+@app.route('/save-fcm-token', methods=['POST'])
+def save_fcm_token():
+    try:
+        data = request.get_json()
+        user_id = data["user_id"]
+        fcm_token = data["fcm_token"]
+        
+        # Save token under user's node
+        db.reference(f'users/{user_id}/fcm_tokens').push(fcm_token)
+        
+        return jsonify({"message": "FCM token saved successfully!"}), 200
+    except Exception as e:
+        return jsonify({"error": f"Failed to save FCM token: {str(e)}"}), 500
+
 # --- WEATHER FORECAST ROUTE ---
 @app.route('/get-weather/<city>', methods=['GET'])
 def get_weather(city):
-    if not api_key:
+    if not API_KEY:
         return jsonify({"error": "Missing API key"}), 500
 
-    url = f"http://api.openweathermap.org/data/2.5/forecast?q={city}&appid={api_key}&units=metric"
+    url = f"http://api.openweathermap.org/data/2.5/forecast?q={city}&appid={API_KEY}&units=metric"
 
     try:
         response = requests.get(url)
         response.raise_for_status()
         data = response.json()
 
-        # Ensure response contains valid data
         if "city" not in data or "list" not in data:
             return jsonify({"error": "Invalid response from API"}), 500
 
-        # Extract forecast details
         forecasts = [
             {
                 "date": forecast["dt_txt"],
                 "temperature": forecast["main"]["temp"],
-                "description": forecast["weather"][0]["description"]
+                "description": forecast["weather"][0]["description"],
+                "icon": forecast["weather"][0]["icon"]  # Include OpenWeather's icon code
             }
             for forecast in data["list"][:5]  # Show next 5 forecasts
         ]
@@ -74,6 +90,57 @@ def get_weather(city):
         })
     except requests.exceptions.RequestException as e:
         return jsonify({"error": f"Request error: {str(e)}"}), 500
+
+# --- WEATHER ALERT SCHEDULER ---
+def check_weather_and_notify():
+    users = db.reference('users').get()
+    if not users:
+        return
+    
+    for user_id, user_data in users.items():
+        if "preferences" in user_data:
+            for pref_key, pref in user_data["preferences"].items():
+                city = pref.get("city", "Berlin")  # Default to Berlin
+                url = f"http://api.openweathermap.org/data/2.5/forecast?q={city}&appid={API_KEY}&units=metric"
+                response = requests.get(url)
+                
+                if response.status_code == 200:
+                    weather_data = response.json()
+                    forecast = weather_data["list"][0]
+                    condition = forecast["weather"][0]["description"]
+                    
+                    if "clear sky" in condition or "sunny" in condition:
+                        send_push_notification(user_id, city, condition)
+
+# --- SEND PUSH NOTIFICATION ---
+def send_push_notification(user_id, city, condition):
+    # Get all FCM tokens for the user
+    tokens = db.reference(f'users/{user_id}/fcm_tokens').get()
+    
+    if not tokens:
+        return  # No tokens registered
+    
+    # Send to all devices
+    message = messaging.MulticastMessage(
+        notification=messaging.Notification(
+            title="🌞 Perfect Weather Alert!",
+            body=f"The weather in {city} is **{condition}**! Enjoy a great day outside! 🌤️",
+        ),
+        tokens=list(tokens.values())
+    )
+    messaging.send_multicast(message)
+
+# --- SCHEDULE WEATHER ALERTS ROUTE ---
+@app.route('/schedule-weather-alerts', methods=['GET'])
+def schedule_alerts():
+    def scheduler():
+        while True:
+            check_weather_and_notify()
+            time.sleep(21600)  # Run every 6 hours
+    
+    thread = threading.Thread(target=scheduler, daemon=True)
+    thread.start()
+    return jsonify({"message": "Weather alerts scheduler started."})
 
 # --- DEBUG ROUTE ---
 @app.route("/", methods=['GET'])
